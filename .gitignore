@@ -1,0 +1,13 @@
+*.d
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.geode
+**/.DS_Store
+**/build
+build-*/
+.cache/
+.vscode/
+.idea/

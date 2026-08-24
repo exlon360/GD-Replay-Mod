@@ -1,0 +1,36 @@
+{
+    "geode": "5.9.0",
+    "gd": {
+        "mac": "2.2081"
+    },
+    "id": "lyric.replay-mod",
+    "name": "Replay Mod",
+    "version": "v0.1.0",
+    "developer": "Lyric",
+    "description": "Record Geometry Dash attempts and watch them back with replay controls.",
+    "tags": [
+        "gameplay",
+        "utility",
+        "interface",
+        "cheat"
+    ],
+    "resources": {
+        "sprites": [
+            "resources/*.png"
+        ]
+    },
+    "settings": {
+        "auto-record": {
+            "name": "Auto-record Attempts",
+            "description": "Record each normal attempt so it can be watched later.",
+            "type": "bool",
+            "default": true
+        },
+        "show-hud": {
+            "name": "Show Replay Button",
+            "description": "Show the purple replay button while playing a level.",
+            "type": "bool",
+            "default": true
+        }
+    }
+}
