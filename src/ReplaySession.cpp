@@ -22,8 +22,8 @@ ReplaySession& ReplaySession::get() {
     return instance;
 }
 
-std::uint64_t ReplaySession::levelFingerprint(PlayLayer* layer) {
-    if (!layer || !layer->m_level) return 0;
+std::uint64_t ReplaySession::levelFingerprint(GJGameLevel* level) {
+    if (!level) return 0;
 
     // Stable FNV-1a fingerprint. This is an identity check, not a security hash.
     std::uint64_t hash = 14695981039346656037ull;
@@ -36,14 +36,17 @@ std::uint64_t ReplaySession::levelFingerprint(PlayLayer* layer) {
         hash *= 1099511628211ull;
     };
 
-    auto& level = *layer->m_level;
-    feed({ level.m_levelString.c_str(), level.m_levelString.size() });
-    feed({ level.m_levelName.c_str(), level.m_levelName.size() });
-    feed(fmt::format("{}", static_cast<int>(level.m_levelID)));
-    feed(fmt::format("{}", level.m_levelVersion));
-    feed(fmt::format("{}", level.m_gameVersion));
-    feed(layer->m_isPlatformer ? "1" : "0");
+    feed({ level->m_levelString.c_str(), level->m_levelString.size() });
+    feed({ level->m_levelName.c_str(), level->m_levelName.size() });
+    feed(fmt::format("{}", static_cast<int>(level->m_levelID)));
+    feed(fmt::format("{}", level->m_levelVersion));
+    feed(fmt::format("{}", level->m_gameVersion));
+    feed(level->isPlatformer() ? "1" : "0");
     return hash;
+}
+
+std::uint64_t ReplaySession::levelFingerprint(PlayLayer* layer) {
+    return layer ? levelFingerprint(layer->m_level) : 0;
 }
 
 std::uint64_t ReplaySession::fingerprintFor(PlayLayer* layer) const {
@@ -56,8 +59,31 @@ std::int64_t ReplaySession::nowMs() {
     ).count();
 }
 
-void ReplaySession::onLayerInit(PlayLayer* layer) {
+bool ReplaySession::onLayerInit(PlayLayer* layer) {
     if (m_layer) restorePlaybackEnvironment(m_layer);
+
+    if (!layer || !layer->m_level) {
+        m_layer = nullptr;
+        cancelQueuedPlayback();
+        return false;
+    }
+
+    auto const fingerprint = levelFingerprint(layer);
+    auto const queuedForLayer = m_queuedRun &&
+        m_queuedRun->levelID == static_cast<int>(layer->m_level->m_levelID) &&
+        m_queuedRun->levelHash != 0 &&
+        m_queuedRun->levelHash == fingerprint &&
+        m_queuedRun->platformer == layer->m_isPlatformer;
+    auto const saveWasPrepared = queuedForLayer && m_hasDontSaveOverride &&
+        m_overriddenLevel == layer->m_level;
+
+    if (!queuedForLayer) {
+        m_queuedRun.reset();
+        restoreLevelSaveFlag();
+    }
+    else if (!saveWasPrepared && m_hasDontSaveOverride) {
+        restoreLevelSaveFlag();
+    }
 
     m_layer = layer;
     m_mode = SessionMode::Idle;
@@ -68,18 +94,22 @@ void ReplaySession::onLayerInit(PlayLayer* layer) {
     m_recordingLimitNotified = false;
     m_resetDepth = 0;
     m_exitPrepared = false;
-    m_levelFingerprint = levelFingerprint(layer);
+    m_levelFingerprint = fingerprint;
     m_hasPracticeOverride = false;
-    m_hasDontSaveOverride = false;
-    m_overriddenLevel = nullptr;
+    if (!saveWasPrepared) {
+        m_hasDontSaveOverride = false;
+        m_overriddenLevel = nullptr;
+    }
     m_hasTimeScaleOverride = false;
     for (auto& held : m_heldButtons) {
         std::fill(std::begin(held), std::end(held), false);
     }
 
-    if (Mod::get()->getSettingValue<bool>("auto-record") && !layer->m_isPracticeMode) {
+    if (!queuedForLayer && Mod::get()->getSettingValue<bool>("auto-record") &&
+        !layer->m_isPracticeMode) {
         beginRecording(layer);
     }
+    return queuedForLayer;
 }
 
 void ReplaySession::beginRecording(PlayLayer* layer) {
@@ -139,7 +169,7 @@ void ReplaySession::onLayerWillReset(PlayLayer* layer) {
     }
 
     // Finished playback remains protected while vanilla performs the reset.
-    if (m_mode == SessionMode::Finished) {
+    if (m_mode == SessionMode::DeathPaused || m_mode == SessionMode::Finished) {
         layer->m_isPracticeMode = true;
         if (layer->m_level) layer->m_level->m_dontSave = true;
     }
@@ -175,7 +205,7 @@ void ReplaySession::onLayerDidReset(PlayLayer* layer) {
         return;
     }
 
-    if (m_mode == SessionMode::Finished) {
+    if (m_mode == SessionMode::DeathPaused || m_mode == SessionMode::Finished) {
         restorePlaybackEnvironment(layer);
         m_mode = SessionMode::Idle;
     }
@@ -277,32 +307,85 @@ bool ReplaySession::beforeProcessCommands(GJBaseGameLayer* layer) {
         m_injecting = false;
     }
     if (step > m_currentRun.durationSteps + kReplayEndToleranceSteps) {
-        finishPlayback(static_cast<PlayLayer*>(layer));
-        Notification::create(
-            "Replay input stream finished",
-            NotificationIcon::Info,
-            2.5f
-        )->show();
+        finishPlayback(static_cast<PlayLayer*>(layer), SessionMode::Finished);
         return true;
     }
     return false;
 }
 
-bool ReplaySession::startLatest(PlayLayer* layer, std::string& error) {
-    if (!layer || !layer->m_level) {
-        error = "Open a level before starting a replay.";
+bool ReplaySession::queueLatest(GJGameLevel* level, std::string& error) {
+    if (!level) {
+        error = "Open a level page before choosing a replay.";
         return false;
     }
 
     for (auto const& summary : ReplayStore::listSummaries()) {
-        if (!isCompatible(layer, summary)) continue;
+        if (!isCompatible(level, summary)) continue;
         if (auto run = ReplayStore::load(summary.sourcePath)) {
-            return startRun(layer, std::move(*run), error);
+            return queueRun(level, std::move(*run), error);
         }
     }
 
     error = "No compatible saved attempts exist for this exact level version yet.";
     return false;
+}
+
+bool ReplaySession::queueRun(GJGameLevel* level, ReplayRun run, std::string& error) {
+    if (!level) {
+        error = "Open a level page before choosing a replay.";
+        return false;
+    }
+    if (!isCompatible(level, run)) {
+        error = "That replay belongs to a different level or level version.";
+        return false;
+    }
+    if (run.practice) {
+        error = "Practice-mode playback is not supported yet.";
+        return false;
+    }
+
+    m_queuedRun = std::move(run);
+    return true;
+}
+
+bool ReplaySession::prepareQueuedPlayback(GJGameLevel* level) {
+    if (!m_queuedRun || !isCompatible(level, *m_queuedRun)) return false;
+
+    if (m_hasDontSaveOverride && m_overriddenLevel == level) {
+        level->m_dontSave = true;
+        return true;
+    }
+
+    restoreLevelSaveFlag();
+    m_originalDontSave = level->m_dontSave;
+    m_hasDontSaveOverride = true;
+    m_overriddenLevel = level;
+    m_overriddenLevel->retain();
+    m_overriddenLevel->m_dontSave = true;
+    return true;
+}
+
+void ReplaySession::cancelQueuedPlayback() {
+    m_queuedRun.reset();
+    if (!m_layer && m_mode == SessionMode::Idle) restoreLevelSaveFlag();
+}
+
+bool ReplaySession::startQueuedPlayback(PlayLayer* layer, std::string& error) {
+    if (!m_queuedRun) {
+        error = "The selected replay is no longer queued.";
+        return false;
+    }
+    auto run = std::move(*m_queuedRun);
+    m_queuedRun.reset();
+    return startRun(layer, std::move(run), error);
+}
+
+bool ReplaySession::isCompatible(GJGameLevel* level, ReplayRun const& run) const {
+    return level &&
+        run.levelID == static_cast<int>(level->m_levelID) &&
+        run.levelHash != 0 && run.levelHash == levelFingerprint(level) &&
+        run.platformer == level->isPlatformer() &&
+        !run.practice;
 }
 
 bool ReplaySession::isCompatible(PlayLayer* layer, ReplayRun const& run) const {
@@ -337,8 +420,15 @@ bool ReplaySession::startRun(PlayLayer* layer, ReplayRun run, std::string& error
         error = "Practice-mode playback is not supported in this first version.";
         return false;
     }
+    auto const preservePreparedSave = m_mode == SessionMode::Idle &&
+        m_hasDontSaveOverride && m_overriddenLevel == layer->m_level;
     if (isPlaybackSession()) releaseHeldButtons(layer);
-    restorePlaybackEnvironment(layer);
+    if (!preservePreparedSave) {
+        restorePlaybackEnvironment(layer);
+    }
+    else {
+        restoreTimeScale();
+    }
     m_previousTimeScale = cocos2d::CCScheduler::get()->getTimeScale();
     m_hasTimeScaleOverride = true;
     m_speed = 1.0f;
@@ -348,10 +438,13 @@ bool ReplaySession::startRun(PlayLayer* layer, ReplayRun run, std::string& error
     m_hasPracticeOverride = true;
     layer->m_isPracticeMode = true;
 
-    m_originalDontSave = layer->m_level->m_dontSave;
-    m_hasDontSaveOverride = true;
-    m_overriddenLevel = layer->m_level;
-    m_overriddenLevel->retain();
+    if (!m_hasDontSaveOverride || m_overriddenLevel != layer->m_level) {
+        restoreLevelSaveFlag();
+        m_originalDontSave = layer->m_level->m_dontSave;
+        m_hasDontSaveOverride = true;
+        m_overriddenLevel = layer->m_level;
+        m_overriddenLevel->retain();
+    }
     m_overriddenLevel->m_dontSave = true;
 
     m_pendingRun = std::move(run);
@@ -403,23 +496,38 @@ void ReplaySession::restorePlaybackEnvironment(PlayLayer* layer) {
     restoreTimeScale();
 }
 
-void ReplaySession::finishPlayback(PlayLayer* layer) {
+void ReplaySession::finishPlayback(PlayLayer* layer, SessionMode finishMode) {
     // Keep practice mode and the level's no-save flag enabled until an
-    // explicit reset, stop, or exit. This makes repeated completion callbacks
-    // harmless and prevents the watched run from ever reaching a save path.
+    // explicit restart or exit. Freeze on the final rendered frame so a death
+    // is reviewable instead of immediately dropping into another attempt.
     releaseHeldButtons(layer);
-    restoreTimeScale();
     m_pendingRun.reset();
     m_playbackIndex = 0;
-    m_mode = SessionMode::Finished;
+    m_mode = finishMode;
+    cocos2d::CCScheduler::get()->setTimeScale(0.0f);
 }
 
 void ReplaySession::onPlaybackDeath(PlayLayer* layer) {
-    finishPlayback(layer);
+    finishPlayback(layer, SessionMode::DeathPaused);
 }
 
 void ReplaySession::onPlaybackComplete(PlayLayer* layer) {
-    finishPlayback(layer);
+    finishPlayback(layer, SessionMode::Finished);
+}
+
+bool ReplaySession::restartPlayback(PlayLayer* layer, std::string& error) {
+    if (!isPlaybackSession() || !layer || layer != m_layer) {
+        error = "No replay is open.";
+        return false;
+    }
+    auto const requestedSpeed = m_speed;
+    auto run = m_currentRun;
+    if (!startRun(layer, std::move(run), error)) return false;
+    m_speed = requestedSpeed;
+    if (m_mode == SessionMode::Playback) {
+        cocos2d::CCScheduler::get()->setTimeScale(m_speed);
+    }
+    return true;
 }
 
 bool ReplaySession::stopPlayback(PlayLayer* layer) {
@@ -455,12 +563,17 @@ bool ReplaySession::togglePause() {
     return false;
 }
 
-float ReplaySession::cycleSpeed() {
+float ReplaySession::adjustSpeed(int direction) {
     static constexpr std::array speeds { 0.25f, 0.5f, 1.0f, 2.0f, 4.0f };
-    if (m_mode != SessionMode::Playback && m_mode != SessionMode::Paused) return m_speed;
+    if (m_mode != SessionMode::Playback && m_mode != SessionMode::Paused &&
+        m_mode != SessionMode::DeathPaused && m_mode != SessionMode::Finished) {
+        return m_speed;
+    }
 
     auto iterator = std::find(speeds.begin(), speeds.end(), m_speed);
-    if (iterator == speeds.end() || ++iterator == speeds.end()) iterator = speeds.begin();
+    if (iterator == speeds.end()) iterator = std::find(speeds.begin(), speeds.end(), 1.0f);
+    if (direction < 0 && iterator != speeds.begin()) --iterator;
+    if (direction > 0 && std::next(iterator) != speeds.end()) ++iterator;
     m_speed = *iterator;
     if (m_mode == SessionMode::Playback) cocos2d::CCScheduler::get()->setTimeScale(m_speed);
     return m_speed;
@@ -483,6 +596,7 @@ void ReplaySession::onLayerDidExit(PlayLayer* layer) {
     m_hasPracticeOverride = false;
     restoreLevelSaveFlag();
     m_hasTimeScaleOverride = false;
+    m_queuedRun.reset();
     m_pendingRun.reset();
     m_mode = SessionMode::Idle;
     m_layer = nullptr;
@@ -499,6 +613,7 @@ bool ReplaySession::isPlaybackSession() const {
     return m_mode == SessionMode::ArmedPlayback ||
            m_mode == SessionMode::Playback ||
            m_mode == SessionMode::Paused ||
+           m_mode == SessionMode::DeathPaused ||
            m_mode == SessionMode::Finished;
 }
 
@@ -522,8 +637,10 @@ std::string ReplaySession::statusText() const {
             return fmt::format("REPLAY  {:.2g}x", m_speed);
         case SessionMode::Paused:
             return fmt::format("PAUSED  {:.2g}x", m_speed);
+        case SessionMode::DeathPaused:
+            return "DEATH PAUSED";
         case SessionMode::Finished:
-            return "REPLAY FINISHED";
+            return "REPLAY COMPLETE";
     }
     return "READY";
 }

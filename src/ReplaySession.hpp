@@ -19,6 +19,7 @@ enum class SessionMode {
     ArmedPlayback,
     Playback,
     Paused,
+    DeathPaused,
     Finished,
 };
 
@@ -26,7 +27,7 @@ class ReplaySession final {
 public:
     static ReplaySession& get();
 
-    void onLayerInit(PlayLayer* layer);
+    bool onLayerInit(PlayLayer* layer);
     void onLayerWillReset(PlayLayer* layer);
     void onLayerDidReset(PlayLayer* layer);
     void onLayerWillExit(PlayLayer* layer);
@@ -39,12 +40,18 @@ public:
     bool shouldForwardInput(GJBaseGameLayer* layer, bool down, int button, bool player1);
     bool beforeProcessCommands(GJBaseGameLayer* layer);
 
-    bool startLatest(PlayLayer* layer, std::string& error);
+    bool queueLatest(GJGameLevel* level, std::string& error);
+    bool queueRun(GJGameLevel* level, ReplayRun run, std::string& error);
+    bool prepareQueuedPlayback(GJGameLevel* level);
+    void cancelQueuedPlayback();
+    bool startQueuedPlayback(PlayLayer* layer, std::string& error);
     bool startRun(PlayLayer* layer, ReplayRun run, std::string& error);
+    bool isCompatible(GJGameLevel* level, ReplayRun const& run) const;
     bool isCompatible(PlayLayer* layer, ReplayRun const& run) const;
+    bool restartPlayback(PlayLayer* layer, std::string& error);
     bool stopPlayback(PlayLayer* layer);
     bool togglePause();
-    float cycleSpeed();
+    float adjustSpeed(int direction);
 
     SessionMode mode() const;
     bool isPlaybackSession() const;
@@ -61,15 +68,17 @@ private:
     void restorePlaybackSafety(PlayLayer* layer);
     void restoreLevelSaveFlag();
     void restoreTimeScale();
-    void finishPlayback(PlayLayer* layer);
+    void finishPlayback(PlayLayer* layer, SessionMode finishMode);
     void releaseHeldButtons(GJBaseGameLayer* layer);
     static std::int64_t nowMs();
+    static std::uint64_t levelFingerprint(GJGameLevel* level);
     static std::uint64_t levelFingerprint(PlayLayer* layer);
     std::uint64_t fingerprintFor(PlayLayer* layer) const;
 
     PlayLayer* m_layer = nullptr;
     SessionMode m_mode = SessionMode::Idle;
     ReplayRun m_currentRun;
+    std::optional<ReplayRun> m_queuedRun;
     std::optional<ReplayRun> m_pendingRun;
     std::size_t m_playbackIndex = 0;
     std::int64_t m_startStep = 0;
